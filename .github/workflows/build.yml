@@ -57,10 +57,26 @@ jobs:
     - name: 检出仓库 (Check Out)
       uses: actions/checkout@v4
 
-    - name: 清理环境（保留 Docker）
-      uses: rokibhasansagar/slimhub_actions@main
-      with:
-        retain: "docker_buildkit,docker_imgcache"
+    # 不再用 rokibhasansagar/slimhub_actions：它的 apt purge 列表里写死了 gh，
+    # 会把 GitHub CLI 删掉，导致「发布到 Releases」报 "runner 缺少 gh CLI"。
+    # 实测该 action 清理后仅多出约 136G 可用空间，这里改成无风险轻量清理，
+    # gh / zip / docker / git 一律保留；docker 镜像缓存也原样不动。
+    - name: 清理环境（保留 Docker 与 gh CLI）
+      run: |
+        set -e
+        echo "::group::清理前磁盘"
+        df -h / 2>/dev/null || true
+        echo "::endgroup::"
+        if command -v gh >/dev/null 2>&1; then
+          echo "gh CLI 已就位: $(gh --version | head -1)"
+        else
+          echo "::warning::gh CLI 缺失，发布步骤会自动恢复"
+        fi
+        sudo apt-get clean -qq || true
+        sudo journalctl --vacuum-size=50M >/dev/null 2>&1 || true
+        echo "::group::清理后磁盘"
+        df -h / 2>/dev/null || true
+        echo "::endgroup::"
 
     - name: 初始化工作目录
       id: pwd
@@ -162,7 +178,12 @@ jobs:
         GH_REPO: ${{ github.repository }}
       run: |
         set -e
-        command -v gh >/dev/null || { echo "::error::runner 缺少 gh CLI"; exit 1; }
+        # 双保险：万一 gh 仍被别的东西删掉，就地装回来，不让整步失败
+        if ! command -v gh >/dev/null 2>&1; then
+          echo "gh CLI 缺失，尝试恢复..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq gh
+        fi
+        command -v gh >/dev/null || { echo "::error::gh CLI 恢复失败"; exit 1; }
         WS="${{ steps.pwd.outputs.workspace-folder }}"
         PKG="${{ steps.package.outputs.pkg }}"
         TAG="u60-kernel-${{ github.run_id }}"
