@@ -119,6 +119,86 @@ jobs:
           echo "summary 未生成，请看上方日志与 Artifact。" >> "$GITHUB_STEP_SUMMARY"
         fi
 
+    # ------------------------------------------------------------------
+    # 编译成功 → 自动发 Release（永久留存；Artifact 只有 30 天）。
+    # build.sh 即使编译失败也会以 0 退出，所以不能靠 job 成功与否判断，
+    # 一律读 out/steps.tsv 里的 build 行。失败时只留 Artifact，不建空 Release。
+    # 仓库改名不影响这里：全部用 github.repository / github.run_id 动态取值。
+    # ------------------------------------------------------------------
+    - name: 判定编译结果
+      id: verdict
+      if: ${{ !cancelled() }}
+      run: |
+        TS="${{ steps.pwd.outputs.workspace-folder }}/out/steps.tsv"
+        if [ -f "$TS" ] && awk -F'\t' '$1=="build" && $2=="OK" {ok=1} END {exit ok?0:1}' "$TS"; then
+          echo "build_ok=true" >> "$GITHUB_OUTPUT"
+          echo "编译结果: OK → 将发布 Release"
+        else
+          echo "build_ok=false" >> "$GITHUB_OUTPUT"
+          echo "编译结果: 非 OK → 跳过 Release，仅保留 Artifact"
+        fi
+
+    - name: 打包成功产物
+      id: package
+      if: ${{ !cancelled() && steps.verdict.outputs.build_ok == 'true' }}
+      run: |
+        set -e
+        command -v zip >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zip; }
+        WS="${{ steps.pwd.outputs.workspace-folder }}"
+        PKG="${{ runner.temp }}/u60-kernel-build-${{ github.run_id }}.zip"
+        rm -f "$PKG"
+        LIST=""
+        for f in artifacts logs steps.tsv summary.md; do
+          [ -e "$WS/out/$f" ] && LIST="$LIST $f"
+        done
+        ( cd "$WS/out" && zip -q -r "$PKG" $LIST )
+        ls -lh "$PKG"
+        echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+
+    - name: 发布到 Releases
+      if: ${{ !cancelled() && steps.verdict.outputs.build_ok == 'true' }}
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        set -e
+        command -v gh >/dev/null || { echo "::error::runner 缺少 gh CLI"; exit 1; }
+        WS="${{ steps.pwd.outputs.workspace-folder }}"
+        PKG="${{ steps.package.outputs.pkg }}"
+        TAG="u60-kernel-${{ github.run_id }}"
+        NOTES="${{ runner.temp }}/u60-release-notes.md"
+        {
+          echo "## U60 基线内核 · 编译成功"
+          echo
+          echo "| 项 | 值 |"
+          echo "|---|---|"
+          echo "| run | \`${{ github.run_id }}\` |"
+          echo "| 源码 | \`${{ github.event.inputs.KERNEL_REPO }} @ ${{ github.event.inputs.KERNEL_REF }}\` |"
+          echo "| 触发 commit | \`${{ github.sha }}\` |"
+          echo
+          echo "产物：\`vmlinux\` / \`Module.symvers\` / \`Image.gz-dtb\` / \`autoconf.h\` / \`build.log\`"
+          echo
+          echo "### steps.tsv"
+          echo '```'
+          cat "$WS/out/steps.tsv"
+          echo '```'
+        } > "$NOTES"
+        ASSETS=( "$PKG" )
+        for f in "$WS/out/steps.tsv" "$WS/out/summary.md" \
+                 "$WS/out/artifacts/Module.symvers"; do
+          [ -f "$f" ] && ASSETS+=( "$f" )
+        done
+        # 手动 Re-run 时 run_id 不变、tag 已存在 → 改成覆盖上传，避免整步失败
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          echo "Release 已存在（重跑），覆盖上传同名 asset"
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber
+        else
+          gh release create "$TAG" "${ASSETS[@]}" \
+            --title "U60 基线内核 ${{ github.run_id }} (build OK)" \
+            --notes-file "$NOTES"
+        fi
+        echo "✅ Release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
+
     - name: 上传产物与日志 (Artifact)
       if: always()
       uses: actions/upload-artifact@v4
