@@ -57,26 +57,13 @@ jobs:
     - name: 检出仓库 (Check Out)
       uses: actions/checkout@v4
 
-    # 不再用 rokibhasansagar/slimhub_actions：它的 apt purge 列表里写死了 gh，
-    # 会把 GitHub CLI 删掉，导致「发布到 Releases」报 "runner 缺少 gh CLI"。
-    # 实测该 action 清理后仅多出约 136G 可用空间，这里改成无风险轻量清理，
-    # gh / zip / docker / git 一律保留；docker 镜像缓存也原样不动。
-    - name: 清理环境（保留 Docker 与 gh CLI）
-      run: |
-        set -e
-        echo "::group::清理前磁盘"
-        df -h / 2>/dev/null || true
-        echo "::endgroup::"
-        if command -v gh >/dev/null 2>&1; then
-          echo "gh CLI 已就位: $(gh --version | head -1)"
-        else
-          echo "::warning::gh CLI 缺失，发布步骤会自动恢复"
-        fi
-        sudo apt-get clean -qq || true
-        sudo journalctl --vacuum-size=50M >/dev/null 2>&1 || true
-        echo "::group::清理后磁盘"
-        df -h / 2>/dev/null || true
-        echo "::endgroup::"
+    # 照 rec 编译仓库：slimhub 清理照常执行（真的腾空间）。
+    # 它的 cleanup.sh 第 202-205 行把 "gh subversion mercurial" 挂在 retain_vcs 分支下，
+    # retain 加 vcs 即可保住 gh CLI；其余大件（Android SDK / Java / 浏览器 / 数据库…）照删。
+    - name: 清理环境（保留 Docker）
+      uses: rokibhasansagar/slimhub_actions@main
+      with:
+        retain: "docker_buildkit,docker_imgcache,vcs"
 
     - name: 初始化工作目录
       id: pwd
@@ -171,22 +158,7 @@ jobs:
         ls -lh "$PKG"
         echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
 
-    - name: 发布到 Releases
-      if: ${{ !cancelled() && steps.verdict.outputs.build_ok == 'true' }}
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        GH_REPO: ${{ github.repository }}
-      run: |
-        set -e
-        # 双保险：万一 gh 仍被别的东西删掉，就地装回来，不让整步失败
-        if ! command -v gh >/dev/null 2>&1; then
-          echo "gh CLI 缺失，尝试恢复..."
-          sudo apt-get update -qq && sudo apt-get install -y -qq gh
-        fi
-        command -v gh >/dev/null || { echo "::error::gh CLI 恢复失败"; exit 1; }
-        WS="${{ steps.pwd.outputs.workspace-folder }}"
-        PKG="${{ steps.package.outputs.pkg }}"
-        TAG="u60-kernel-${{ github.run_id }}"
+        # Release 正文，给 softprops 的 body_path 用（不依赖系统 gh）
         NOTES="${{ runner.temp }}/u60-release-notes.md"
         {
           echo "## U60 基线内核 · 编译成功"
@@ -204,21 +176,24 @@ jobs:
           cat "$WS/out/steps.tsv"
           echo '```'
         } > "$NOTES"
-        ASSETS=( "$PKG" )
-        for f in "$WS/out/steps.tsv" "$WS/out/summary.md" \
-                 "$WS/out/artifacts/Module.symvers"; do
-          [ -f "$f" ] && ASSETS+=( "$f" )
-        done
-        # 手动 Re-run 时 run_id 不变、tag 已存在 → 改成覆盖上传，避免整步失败
-        if gh release view "$TAG" >/dev/null 2>&1; then
-          echo "Release 已存在（重跑），覆盖上传同名 asset"
-          gh release upload "$TAG" "${ASSETS[@]}" --clobber
-        else
-          gh release create "$TAG" "${ASSETS[@]}" \
-            --title "U60 基线内核 ${{ github.run_id }} (build OK)" \
-            --notes-file "$NOTES"
-        fi
-        echo "✅ Release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
+
+    # 与 rec 编译仓库一致：softprops/action-gh-release@v2 是纯 Node action，
+    # 不调用系统 gh 二进制。slimhub 删不删 gh 都不影响 —— 这就是「以前都可以」的原因。
+    - name: 发布到 Releases
+      if: ${{ !cancelled() && steps.verdict.outputs.build_ok == 'true' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: u60-kernel-${{ github.run_id }}
+        name: U60 基线内核 ${{ github.run_id }} (build OK)
+        body_path: ${{ runner.temp }}/u60-release-notes.md
+        overwrite_files: true          # Re-run 时同名 asset 自动覆盖
+        files: |
+          ${{ steps.package.outputs.pkg }}
+          ${{ steps.pwd.outputs.workspace-folder }}/out/steps.tsv
+          ${{ steps.pwd.outputs.workspace-folder }}/out/summary.md
+          ${{ steps.pwd.outputs.workspace-folder }}/out/artifacts/Module.symvers
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: 上传产物与日志 (Artifact)
       if: always()
